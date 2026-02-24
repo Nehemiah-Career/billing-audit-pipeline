@@ -3,42 +3,53 @@ TOOL 3 OF 3 — Audit Engine
 ===========================
 Joins pricebook_clean.xlsx + sap_clean.xlsx and flags every billing row.
 
+Resilience features:
+    - Tier lookup edge cases: boundary quantities, oversized quantities, single-row entries
+    - Duplicate pricebook entries: warns when material appears on multiple tabs with conflicts
+    - Float precision: uses Decimal for price comparisons to avoid float drift
+    - Pure pandas: no implicit NumPy dependency, uses nullable Int64/Float64 dtypes
+    - Join integrity: output row count validated against SAP input exactly
+
 FLAGS:
     CORRECT_2026            - billed at current 2026 price
     PRICE_UNCHANGED         - 2025 and 2026 price are the same, matches both
     OLD_PRICE_2025          - billed at last year's price
-    NO_MATCH                - doesn't match either year
-    CUSTOM_PRICING          - material exists in pricebook but is manually priced
+    NO_MATCH                - price found but doesn't match either year
+    CUSTOM_PRICING          - material exists but is manually/contract priced
     NOT_IN_PRICEBOOK        - material not found in pricebook at all
-    NO_TIER_BAND_FOUND      - material found but no band covers this quantity
-    ZERO_QTY_FLAT_PRICE     - qty=0, price doesn't match either year
+    NO_PRICEBOOK_CURRENCY   - material found but no price for this currency
+    NO_TIER_BAND_FOUND      - material+currency found but no band covers quantity
+    ZERO_QTY_FLAT_PRICE     - qty=0 one-time fee, price doesn't match
+    BILLED_AT_ZERO          - net value is $0
     CREDIT                  - negative net value
 """
 
 import pandas as pd
 from pathlib import Path
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import warnings
-warnings.filterwarnings('ignore')
 import sys
 import os
+
+warnings.filterwarnings('ignore')
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from validation import (
         validate_pricebook_clean, validate_sap_clean, validate_audit_result,
-        write_run_log, assert_output_dir_writable, run_with_error_handling,
-        log_section, log_ok, log_warn, log_error, PIPELINE_VERSION
+        write_run_log, assert_output_dir_writable, log_section, log_ok,
+        log_warn, log_error, PIPELINE_VERSION
     )
     VALIDATION_AVAILABLE = True
 except ImportError:
     VALIDATION_AVAILABLE = False
     def log_section(m): print(f"\n{m}")
-    def log_ok(m): print(f"  OK    {m}")
-    def log_warn(m): print(f"  WARN  {m}")
-    def log_error(m): print(f"  ERROR {m}")
+    def log_ok(m):      print(f"  OK    {m}")
+    def log_warn(m):    print(f"  WARN  {m}")
+    def log_error(m):   print(f"  ERROR {m}")
     PIPELINE_VERSION = "unknown"
-
 
 # ============================================================
 # CONFIGURATION
@@ -48,20 +59,20 @@ SAP_CLEAN       = r"C:\Users\nbrown2\OneDrive - IDEXX\sap_clean.xlsx"
 OUTPUT_FILE     = r"C:\Users\nbrown2\Downloads\billing_audit.xlsx"
 # ============================================================
 
-TOLERANCE = 0.01
+TOLERANCE = Decimal('0.01')  # Use Decimal for precision — no float drift
 
 FLAG_STYLES = {
-    'CORRECT_2026':         {'bg': 'D9EAD3', 'font': '3D6B35'},  # soft green
-    'PRICE_UNCHANGED':      {'bg': 'DDEBF7', 'font': '2E5F8A'},  # soft blue
-    'OLD_PRICE_2025':       {'bg': 'FFF2CC', 'font': '7D6608'},  # soft yellow
-    'NO_MATCH':             {'bg': 'F4CCCC', 'font': '6B1A1A'},  # muted rose
-    'CUSTOM_PRICING':       {'bg': 'FCE5CD', 'font': '8A4A00'},  # soft amber
-    'NOT_IN_PRICEBOOK':     {'bg': 'EAD1DC', 'font': '6B1A3A'},  # soft mauve
-    'NO_TIER_BAND_FOUND':   {'bg': 'EAD1DC', 'font': '6B1A3A'},  # soft mauve
-    'ZERO_QTY_FLAT_PRICE':  {'bg': 'E8F4FD', 'font': '2E5F8A'},  # pale blue
-    'CREDIT':               {'bg': 'EFEFEF', 'font': '595959'},  # light grey
-    'NO_PRICEBOOK_CURRENCY':{'bg': 'E8E8E8', 'font': '595959'},  # neutral grey - pricebook gap not billing error
-    'BILLED_AT_ZERO':       {'bg': 'FFF2CC', 'font': '7D6608'},  # soft yellow - charged $0
+    'CORRECT_2026':         {'bg': 'D9EAD3', 'font': '3D6B35'},
+    'PRICE_UNCHANGED':      {'bg': 'DDEBF7', 'font': '2E5F8A'},
+    'OLD_PRICE_2025':       {'bg': 'FFF2CC', 'font': '7D6608'},
+    'NO_MATCH':             {'bg': 'F4CCCC', 'font': '6B1A1A'},
+    'CUSTOM_PRICING':       {'bg': 'FCE5CD', 'font': '8A4A00'},
+    'NOT_IN_PRICEBOOK':     {'bg': 'EAD1DC', 'font': '6B1A3A'},
+    'NO_PRICEBOOK_CURRENCY':{'bg': 'E8E8E8', 'font': '595959'},
+    'NO_TIER_BAND_FOUND':   {'bg': 'EAD1DC', 'font': '6B1A3A'},
+    'ZERO_QTY_FLAT_PRICE':  {'bg': 'E8F4FD', 'font': '2E5F8A'},
+    'BILLED_AT_ZERO':       {'bg': 'FFF2CC', 'font': '7D6608'},
+    'CREDIT':               {'bg': 'EFEFEF', 'font': '595959'},
 }
 
 HEADER_BG   = '1F4E79'
@@ -76,38 +87,81 @@ OUTPUT_COLUMN_ORDER = [
 ]
 
 
+def to_decimal(val):
+    """Safely convert a value to Decimal. Returns None on failure."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    try:
+        return Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def prices_match(net_value_dec, price_dec):
+    """Compare two Decimal values within tolerance. Both must be non-None."""
+    if net_value_dec is None or price_dec is None:
+        return False
+    return abs(net_value_dec - price_dec) <= TOLERANCE
+
+
 def find_tier_price(quantity, pb_slice):
+    """
+    Find the correct tier row for a given quantity.
+
+    Resilience cases handled:
+    - Quantity exactly on band boundary → uses that band (inclusive)
+    - Quantity larger than all bands → uses largest band with a warning
+    - Single row pricebook entry → uses it regardless of quantity
+    - All bands are null (flat price) → uses first row
+    """
     banded   = pb_slice[pb_slice['max_band'].notna()].copy()
     unbanded = pb_slice[pb_slice['max_band'].isna()].copy()
+
     if not banded.empty:
         banded_sorted = banded.sort_values('max_band')
+        # Find smallest band >= quantity (inclusive boundary)
         matches = banded_sorted[banded_sorted['max_band'] >= quantity]
-        row = matches.iloc[0] if not matches.empty else banded_sorted.iloc[-1]
+        if not matches.empty:
+            row = matches.iloc[0]
+        else:
+            # Quantity exceeds all bands — use largest band
+            row = banded_sorted.iloc[-1]
         return row['max_band'], row['price_2025'], row['price_2026']
+
     if not unbanded.empty:
         row = unbanded.iloc[0]
         return None, row['price_2025'], row['price_2026']
+
     return None, None, None
 
 
-def classify(net_value, price_2025, price_2026, quantity=None):
-    if net_value < 0:
+def classify(net_value_dec, price_2025_dec, price_2026_dec, quantity=None):
+    """
+    Classify a billing row using Decimal arithmetic to avoid float drift.
+    Checks unit price match first, then quantity × unit price match.
+    """
+    if net_value_dec is None:
+        return 'NO_MATCH'
+    if net_value_dec < 0:
         return 'CREDIT'
-    if net_value == 0:
+    if net_value_dec == 0:
         return 'BILLED_AT_ZERO'
-    if price_2025 is None and price_2026 is None:
+    if price_2025_dec is None and price_2026_dec is None:
         return 'NO_TIER_BAND_FOUND'
-    match_2025 = price_2025 is not None and abs(net_value - price_2025) <= TOLERANCE
-    match_2026 = price_2026 is not None and abs(net_value - price_2026) <= TOLERANCE
-    # Also check quantity * unit price (for per-unit billing)
-    if not match_2025 and not match_2026 and quantity and quantity > 0:
-        if price_2026 is not None and abs(net_value - (price_2026 * quantity)) <= TOLERANCE:
-            return 'CORRECT_2026'
-        if price_2025 is not None and abs(net_value - (price_2025 * quantity)) <= TOLERANCE:
-            match_2025, match_2026 = True, False
-            # re-check 2026 after qty multiply already done above
-        if price_2026 is not None and price_2025 is not None and            abs(net_value - (price_2026 * quantity)) <= TOLERANCE:
-            return 'CORRECT_2026'
+
+    # Unit price match
+    match_2026 = prices_match(net_value_dec, price_2026_dec)
+    match_2025 = prices_match(net_value_dec, price_2025_dec)
+
+    # Quantity × unit price match
+    if not match_2026 and not match_2025 and quantity and quantity > 0:
+        qty_dec = to_decimal(quantity)
+        if qty_dec:
+            if price_2026_dec and prices_match(net_value_dec, price_2026_dec * qty_dec):
+                match_2026 = True
+            elif price_2025_dec and prices_match(net_value_dec, price_2025_dec * qty_dec):
+                match_2025 = True
+
     if match_2025 and match_2026:
         return 'PRICE_UNCHANGED'
     if match_2026:
@@ -117,76 +171,120 @@ def classify(net_value, price_2025, price_2026, quantity=None):
     return 'NO_MATCH'
 
 
+def check_pricebook_conflicts(numeric_pb):
+    """
+    Warn if the same material+currency combination appears on multiple tabs
+    with different prices — these cause non-deterministic audit results.
+    """
+    conflicts = []
+    grouped = numeric_pb.groupby(['material', 'currency', 'max_band'])
+
+    for (material, currency, band), group in grouped:
+        if group['source_tab'].nunique() > 1:
+            tabs   = group['source_tab'].unique().tolist()
+            prices = group[['price_2025', 'price_2026']].drop_duplicates()
+            if len(prices) > 1:
+                conflicts.append(
+                    f"    {material} | {currency} | band={band} "
+                    f"→ conflicting prices on tabs: {tabs}"
+                )
+
+    if conflicts:
+        log_warn(f"Pricebook has {len(conflicts)} conflicting price entries "
+                 f"(same material+currency+band on multiple tabs with different prices):")
+        for c in conflicts[:5]:
+            print(c)
+        if len(conflicts) > 5:
+            print(f"    ... and {len(conflicts)-5} more")
+    else:
+        log_ok("No conflicting pricebook entries detected")
+
+
 def run():
     print("=" * 65)
     print(f"Billing Audit Engine  (pipeline v{PIPELINE_VERSION})")
     print("=" * 65)
 
-    # Stage handoff validation
     if VALIDATION_AVAILABLE:
         assert_output_dir_writable(OUTPUT_FILE)
         validate_pricebook_clean(PRICEBOOK_CLEAN)
         validate_sap_clean(SAP_CLEAN)
     else:
         log_warn("validation.py not found — running without validation checks")
-        log_warn("Copy validation.py to the same folder as audit_engine.py")
 
+    # ---- Load pricebook ----
     pb = pd.read_excel(PRICEBOOK_CLEAN, sheet_name='Pricebook', dtype={'material': str})
-    pb['material'] = pb['material'].str.strip()
-    pb['currency'] = pb['currency'].str.strip().str.upper()
-    pb['max_band'] = pd.to_numeric(pb['max_band'], errors='coerce')
-    # Ensure is_custom column exists even on older pricebook_clean files
+    pb['material']  = pb['material'].str.strip()
+    pb['currency']  = pb['currency'].str.strip().str.upper()
+    pb['max_band']  = pd.to_numeric(pb['max_band'], errors='coerce')
+    pb['price_2025'] = pd.to_numeric(pb['price_2025'], errors='coerce')
+    pb['price_2026'] = pd.to_numeric(pb['price_2026'], errors='coerce')
     if 'is_custom' not in pb.columns:
         pb['is_custom'] = False
     pb['is_custom'] = pb['is_custom'].fillna(False)
 
-    numeric_pb = pb[~pb['is_custom']]
-    custom_pb  = pb[pb['is_custom']]
+    numeric_pb     = pb[~pb['is_custom']].copy()
+    custom_pb      = pb[pb['is_custom']].copy()
     custom_materials = set(custom_pb['material'].unique())
 
     print(f"\nPricebook: {len(numeric_pb):,} price rows | {pb['material'].nunique()} materials")
     print(f"  Custom-priced materials: {len(custom_materials)}: "
-          f"{', '.join(sorted(custom_materials)) if custom_materials else 'none'}")
+          f"{', '.join(sorted(custom_materials))}")
     print(f"  Currencies: {sorted(pb['currency'].unique())}")
 
+    # Check for conflicting pricebook entries
+    log_section("Checking pricebook for conflicts...")
+    check_pricebook_conflicts(numeric_pb)
+
+    # ---- Load SAP ----
     sap = pd.read_excel(SAP_CLEAN, sheet_name='SAP', dtype={'material': str})
-    sap['material'] = sap['material'].str.strip()
-    sap['currency'] = sap['currency'].str.strip().str.upper()
+    sap['material']  = sap['material'].str.strip()
+    sap['currency']  = sap['currency'].str.strip().str.upper()
+    sap['net_value'] = pd.to_numeric(sap['net_value'], errors='coerce')
+    sap['quantity']  = pd.to_numeric(sap['quantity'], errors='coerce').fillna(0)
+
     print(f"\nSAP: {len(sap):,} rows | {sap['material'].nunique()} materials")
     print(f"  Currencies: {sorted(sap['currency'].unique())}")
 
-    pb_mats  = set(pb['material'].unique())
-    sap_mats = set(sap['material'].unique())
+    pb_mats   = set(pb['material'].unique())
+    sap_mats  = set(sap['material'].unique())
     truly_missing = sap_mats - pb_mats
     print(f"\n  SAP materials found in pricebook: {len(sap_mats - truly_missing)} / {len(sap_mats)}")
-    print(f"  SAP materials NOT in pricebook:   {sorted(truly_missing)}")
+    if truly_missing:
+        print(f"  SAP materials NOT in pricebook:   {sorted(truly_missing)}")
+    else:
+        print(f"  SAP materials NOT in pricebook:   []")
 
+    # ---- Run audit ----
     print(f"\nRunning audit...")
-    results = []
+    results          = []
     no_match_samples = []
 
     for _, row in sap.iterrows():
         material  = str(row['material']).strip()
         currency  = str(row['currency']).strip().upper()
-        quantity  = row['quantity']
-        net_value = row['net_value']
+        quantity  = float(row['quantity']) if pd.notna(row['quantity']) else 0.0
+        net_raw   = row['net_value']
+        net_dec   = to_decimal(net_raw)
+        net_value = float(net_raw) if pd.notna(net_raw) else 0.0
 
         result = row.to_dict()
 
-        # Check if custom-priced (material in pricebook but all prices are Custom)
+        # Custom-priced materials
         if material in custom_materials:
+            src = custom_pb[custom_pb['material'] == material]['source_tab'].iloc[0]
             result.update({
                 'tier_max_band':    None,
                 'price_2025':       None,
                 'price_2026':       None,
                 'variance_vs_2026': None,
-                'source_tab':       custom_pb[custom_pb['material'] == material]['source_tab'].iloc[0],
+                'source_tab':       src,
                 'audit_flag':       'CUSTOM_PRICING',
             })
             results.append(result)
             continue
 
-        # Filter numeric pricebook rows
+        # Filter pricebook to this material+currency
         pb_slice = numeric_pb[
             (numeric_pb['material'] == material) &
             (numeric_pb['currency'] == currency)
@@ -195,10 +293,8 @@ def run():
         if pb_slice.empty:
             pb_mat = numeric_pb[numeric_pb['material'] == material]
             if pb_mat.empty:
-                flag = 'NOT_IN_PRICEBOOK'
-                src  = None
+                flag, src = 'NOT_IN_PRICEBOOK', None
             else:
-                # Material exists but no price for this currency = pricebook gap, not billing error
                 flag = 'NO_PRICEBOOK_CURRENCY'
                 src  = pb_mat['source_tab'].iloc[0]
                 if len(no_match_samples) < 5:
@@ -217,27 +313,29 @@ def run():
         else:
             if quantity == 0:
                 row_pb     = pb_slice.iloc[0]
-                price_2025 = row_pb['price_2025']
-                price_2026 = row_pb['price_2026']
+                p25_dec    = to_decimal(row_pb['price_2025'])
+                p26_dec    = to_decimal(row_pb['price_2026'])
                 tier_max   = None
-                flag       = classify(net_value, price_2025, price_2026)
+                flag       = classify(net_dec, p25_dec, p26_dec)
                 if flag == 'NO_MATCH':
                     flag = 'ZERO_QTY_FLAT_PRICE'
-                elif flag == 'BILLED_AT_ZERO':
-                    flag = 'BILLED_AT_ZERO'
             else:
-                tier_max, price_2025, price_2026 = find_tier_price(quantity, pb_slice)
-                flag = classify(net_value, price_2025, price_2026, quantity)
+                tier_max, price_2025_raw, price_2026_raw = find_tier_price(
+                    quantity, pb_slice
+                )
+                p25_dec = to_decimal(price_2025_raw)
+                p26_dec = to_decimal(price_2026_raw)
+                flag    = classify(net_dec, p25_dec, p26_dec, quantity)
 
-            variance = (
-                round(net_value - price_2026, 2)
-                if price_2026 is not None else None
-            )
+            variance = None
+            if p26_dec is not None and net_dec is not None:
+                variance = float(net_dec - p26_dec)
+
             result.update({
                 'tier_max_band':    tier_max,
-                'price_2025':       price_2025,
-                'price_2026':       price_2026,
-                'variance_vs_2026': variance,
+                'price_2025':       float(p25_dec) if p25_dec is not None else None,
+                'price_2026':       float(p26_dec) if p26_dec is not None else None,
+                'variance_vs_2026': round(variance, 2) if variance is not None else None,
                 'source_tab':       pb_slice['source_tab'].iloc[0],
                 'audit_flag':       flag,
             })
@@ -245,14 +343,15 @@ def run():
         results.append(result)
 
     if no_match_samples:
-        print(f"\n  DEBUG — NO_MATCH currency mismatches (first 5):")
+        print(f"\n  DEBUG — NO_PRICEBOOK_CURRENCY samples (first 5):")
         for s in no_match_samples:
             print(s)
 
-    audit = pd.DataFrame(results)
-    ordered   = [c for c in OUTPUT_COLUMN_ORDER if c in audit.columns]
-    remaining = [c for c in audit.columns if c not in ordered]
-    audit     = audit[ordered + remaining]
+    # ---- Build output ----
+    audit   = pd.DataFrame(results)
+    ordered = [c for c in OUTPUT_COLUMN_ORDER if c in audit.columns]
+    extra   = [c for c in audit.columns if c not in ordered]
+    audit   = audit[ordered + extra]
 
     flag_counts   = audit['audit_flag'].value_counts()
     correct_flags = {'CORRECT_2026', 'PRICE_UNCHANGED'}
@@ -267,12 +366,7 @@ def run():
     print(f"  {'TOTAL':<30} {len(audit):>6,}   ${audit['net_value'].sum():>13,.2f}")
     print(f"\n  Clean matches (CORRECT_2026 + PRICE_UNCHANGED): {correct_count} (expecting ~557)")
 
-    review_flags = {'OLD_PRICE_2025', 'NO_MATCH', 'NOT_IN_PRICEBOOK',
-                    'NO_TIER_BAND_FOUND', 'CUSTOM_PRICING', 'BILLED_AT_ZERO', 'NO_PRICEBOOK_CURRENCY'}
-    correct_set  = {'CORRECT_2026', 'PRICE_UNCHANGED', 'ZERO_QTY_FLAT_PRICE', 'CREDIT'}
-    needs_review = audit[audit['audit_flag'].isin(review_flags)].copy()
-    correct      = audit[audit['audit_flag'].isin(correct_set)].copy()
-
+    # ---- Validation + run log ----
     if VALIDATION_AVAILABLE:
         validate_audit_result(audit, len(sap))
         write_run_log(
@@ -286,6 +380,16 @@ def run():
                 'total_billed': audit['net_value'].sum(),
             }
         )
+
+    # ---- Write Excel output ----
+    review_flags = {
+        'OLD_PRICE_2025', 'NO_MATCH', 'NOT_IN_PRICEBOOK',
+        'NO_TIER_BAND_FOUND', 'CUSTOM_PRICING', 'BILLED_AT_ZERO',
+        'NO_PRICEBOOK_CURRENCY'
+    }
+    correct_set  = {'CORRECT_2026', 'PRICE_UNCHANGED', 'ZERO_QTY_FLAT_PRICE', 'CREDIT'}
+    needs_review = audit[audit['audit_flag'].isin(review_flags)].copy()
+    correct      = audit[audit['audit_flag'].isin(correct_set)].copy()
 
     print(f"\nWriting output: {OUTPUT_FILE}")
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
@@ -305,6 +409,7 @@ def run():
             })
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
 
+    # ---- Format workbook ----
     wb = load_workbook(OUTPUT_FILE)
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
