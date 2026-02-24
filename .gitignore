@@ -1,0 +1,27 @@
+# Real data files — never commit these
+*.xlsx
+*.xls
+*.csv
+*.txt
+run_log.txt
+
+# Exception — sample data is safe to commit
+!sample_data/*.xlsx
+!sample_data/*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
