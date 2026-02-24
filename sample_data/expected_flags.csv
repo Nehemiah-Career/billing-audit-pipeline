@@ -1,0 +1,13 @@
+Material,Order quantity,Curr.,Net Value,_expected_flag
+XX-2867825-00,50,NZD,"9,889.00",qty_match
+XX-1419610-00,250,GBP,"36,037.50",qty_match
+XX-5614226-00,250,CAD,-155.40,credit
+XX-5108603-00,5,CAD,67.57,correct
+XX-4744854-00,15,CAD,64.68,old_price
+XX-3341057-00,50,CAD,690.14,correct
+XX-2719583-00,250,USD,700.26,correct
+XX-2458591-00,250,USD,614.65,correct
+XX-8078673-00,15,AUD,486.19,correct
+XX-1533224-00,5,USD,105.67,correct
+XX-1499914-00,15,AUD,156.37,correct
+XX-2571945-00,5,USD,0.00,zero
