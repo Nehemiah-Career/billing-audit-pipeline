@@ -137,5 +137,5 @@ See `generate_sample_data.py` to regenerate with different random seeds.
 
 ## Author
 
-Nehemiah Brown — Data Analyst, 
+Nehemiah Brown 
 Built as part of an ongoing billing automation initiative at IDEXX Laboratories
