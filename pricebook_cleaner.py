@@ -238,6 +238,20 @@ def find_min_band_col(columns):
     return None
 
 
+def find_description_col(columns):
+    """Find the product description column in pricebook tabs."""
+    patterns = [
+        r'sap.*desc', r'description', r'product.*desc',
+        r'material.*desc', r'item.*desc', r'^desc$',
+        r'product.*name', r'item.*name', r'name',
+    ]
+    for pat in patterns:
+        for col in columns:
+            if re.search(pat, str(col).lower().strip()):
+                return col
+    return None
+
+
 def find_header_row(raw_df):
     """
     Scan rows to find the header. Handles tabs where headers aren't on row 0.
@@ -340,8 +354,9 @@ def process_tab(wb, sheet_name):
     if part_col is None:
         return [], "could not identify part number column"
 
-    max_col = find_max_band_col(df.columns)
-    min_col = find_min_band_col(df.columns)
+    max_col  = find_max_band_col(df.columns)
+    min_col  = find_min_band_col(df.columns)
+    desc_col = find_description_col(df.columns)
 
     # Detect price columns with confidence scoring
     price_cols      = []
@@ -398,26 +413,40 @@ def process_tab(wb, sheet_name):
 
         if row_has_numeric:
             for currency, year_prices in prices.items():
-                rows.append({
-                    'material':   material,
-                    'max_band':   max_band,
-                    'currency':   currency,
-                    'price_2025': year_prices.get('2025'),
-                    'price_2026': year_prices.get('2026'),
-                    'source_tab': sheet_name,
-                    'is_custom':  False,
+                # Extract description — take first non-null value from desc col
+                    desc_val = None
+                    if desc_col and desc_col in row.index:
+                        raw_desc = row.get(desc_col)
+                        if pd.notna(raw_desc) and str(raw_desc).strip() not in ('', 'nan'):
+                            desc_val = str(raw_desc).strip()
+
+                    rows.append({
+                    'material':    material,
+                    'max_band':    max_band,
+                    'currency':    currency,
+                    'price_2025':  year_prices.get('2025'),
+                    'price_2026':  year_prices.get('2026'),
+                    'source_tab':  sheet_name,
+                    'is_custom':   False,
+                    'pb_description': desc_val,
                 })
         elif row_has_custom:
             custom_materials.add(material)
+            desc_val = None
+            if desc_col and desc_col in row.index:
+                raw_desc = row.get(desc_col)
+                if pd.notna(raw_desc) and str(raw_desc).strip() not in ('', 'nan'):
+                    desc_val = str(raw_desc).strip()
             for _, currency, _ in price_cols:
                 rows.append({
-                    'material':   material,
-                    'max_band':   None,
-                    'currency':   currency,
-                    'price_2025': None,
-                    'price_2026': None,
-                    'source_tab': sheet_name,
-                    'is_custom':  True,
+                    'material':    material,
+                    'max_band':    None,
+                    'currency':    currency,
+                    'price_2025':  None,
+                    'price_2026':  None,
+                    'source_tab':  sheet_name,
+                    'is_custom':   True,
+                    'pb_description': desc_val,
                 })
 
     # Deduplicate custom rows
@@ -499,11 +528,24 @@ def run(pricebook_path):
     df_out['max_band'] = pd.to_numeric(df_out['max_band'], errors='coerce')
     df_out = df_out.sort_values(['material', 'currency', 'max_band']).reset_index(drop=True)
 
-    # Drift detection — warn if fewer rows than expected
+    # Drift detection — warn on absolute minimum AND relative drop
     EXPECTED_MIN_ROWS = 7000
+    EXPECTED_MIN_TABS = 19
+    EXPECTED_MIN_MATERIALS = 282
+
     if len(numeric_rows) < EXPECTED_MIN_ROWS:
-        log_warn(f"Only {len(numeric_rows):,} price rows extracted — expected {EXPECTED_MIN_ROWS:,}+. "
+        log_warn(f"Only {len(numeric_rows):,} price rows — expected {EXPECTED_MIN_ROWS:,}+. "
                  f"Check if any tabs were renamed or restructured.")
+
+    tabs_processed = len(wb.sheetnames) - len(skipped)
+    if tabs_processed < EXPECTED_MIN_TABS:
+        log_warn(f"Only {tabs_processed} tabs processed — expected {EXPECTED_MIN_TABS}+. "
+                 f"A tab may have been deleted or renamed.")
+
+    unique_mats = df_out['material'].nunique()
+    if unique_mats < EXPECTED_MIN_MATERIALS:
+        log_warn(f"Only {unique_mats} unique materials — expected {EXPECTED_MIN_MATERIALS}+. "
+                 f"Check if a product tab was removed from the pricebook.")
 
     print(f"\nSummary:")
     print(f"  Unique materials:      {df_out['material'].nunique():,}")
@@ -517,13 +559,21 @@ def run(pricebook_path):
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         df_out.to_excel(writer, sheet_name='Pricebook', index=False)
         ws = writer.sheets['Pricebook']
+        from openpyxl.styles import Font, PatternFill, Alignment
+        # Header formatting
+        for cell in ws[1]:
+            cell.font      = Font(bold=True, color='FFFFFF', name='Arial')
+            cell.fill      = PatternFill('solid', start_color='1F4E79')
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        ws.row_dimensions[1].height = 20
+        # Freeze top row
+        ws.freeze_panes = 'A2'
+        # Auto-filter on all columns
+        ws.auto_filter.ref = ws.dimensions
+        # Column widths
         for col in ws.columns:
             max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
-        from openpyxl.styles import Font, PatternFill
-        for cell in ws[1]:
-            cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = PatternFill('solid', start_color='1F4E79')
 
     print(f"\nOutput saved: {output_path}")
     print("=" * 60)

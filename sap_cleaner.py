@@ -6,12 +6,14 @@ Excel file ready to join against pricebook_clean.xlsx.
 
 Resilience features:
     - Extra header rows: scans up to row 30 for the real header
+    - Shifted columns: re-scans all rows if initial header scan fails
+    - Missing columns: reports ALL missing columns at once with fix suggestions
+    - Partial column matches: warns when a column name is close but not exact
     - Subtotal row detection: drops SAP-injected subtotal/total rows
-    - Column name drift: broad pattern matching for renamed columns
     - European number format: handles both 1,234.56 and 1.234,56
-    - Mid-export blank rows: dropped automatically
+    - Blank rows mid-export: dropped automatically
     - Multi-sheet exports: scans all sheets for the one with billing data
-    - Encoding issues: handles common Excel encoding edge cases
+    - Unknown currency codes: warns before audit runs
 
 SETUP:
     pip install pandas openpyxl
@@ -33,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from validation import (
         assert_file_exists, assert_output_dir_writable,
-        assert_min_rows, log_section, log_ok, log_warn, log_error, PIPELINE_VERSION
+        log_section, log_ok, log_warn, log_error, PIPELINE_VERSION
     )
     VALIDATION_AVAILABLE = True
 except ImportError:
@@ -50,38 +52,38 @@ except ImportError:
 SAP_FILE = r"C:\Users\nbrown2\OneDrive - IDEXX\sap export jan.xlsx"
 # ============================================================
 
-# Required columns — broad patterns to survive SAP config changes
+# Required columns with broad pattern lists — survives SAP config changes
 COL_PATTERNS = {
-    'material':  ['MATERIAL', 'PART NUMBER', 'PART NO', 'SKU', 'ITEM'],
-    'quantity':  ['ORDER QUANT', 'ORDER QTY', 'ORDERQUAN', 'QUANTITY', 'QTY', 'UNITS'],
+    'material':  ['MATERIAL', 'PART NUMBER', 'PART NO', 'PART#', 'SKU', 'ITEM NO',
+                  'ITEM NUMBER', 'PRODUCT NO', 'MATL'],
+    'quantity':  ['ORDER QUANT', 'ORDER QTY', 'ORDERQUAN', 'QUANTITY', 'QTY',
+                  'UNITS', 'ORDERED QTY', 'BILLED QTY', 'BILL QTY'],
     'net_value': ['NET VALUE', 'NETVALUE', 'NET VAL', 'NET AMT', 'NET AMOUNT',
-                  'BILLED AMT', 'BILLED AMOUNT', 'AMOUNT'],
-    'currency':  ['CURR', 'CURRENCY', 'CCY'],
+                  'BILLED AMT', 'BILLED AMOUNT', 'AMOUNT', 'REVENUE', 'BILLING AMT'],
+    'currency':  ['CURR', 'CURRENCY', 'CCY', 'CUR'],
 }
 
 # Context columns — carried through if found, not required
 CONTEXT_PATTERNS = {
     'sales_org':     ['SORG', 'S ORG', 'SALES ORG', 'SALESORG'],
-    'created_on':    ['CREATED ON', 'CREATEDON', 'CREATE DATE', 'DATE'],
+    'created_on':    ['CREATED ON', 'CREATEDON', 'CREATE DATE', 'CREATION DATE'],
     'order_number':  ['ORDER#', 'ORDER #', 'ORDER NUMBER', 'ORDERNO', 'ORDER NO',
-                      'DOCUMENT', 'DOC NO'],
-    'ship_to':       ['SHIP-TO', 'SHIP TO', 'SHIPTO', 'SHIP_TO'],
-    'customer_name': ['NAME 1', 'NAME1', 'CUSTOMER NAME', 'CUSTOMER', 'CLIENT'],
+                      'DOCUMENT', 'DOC NO', 'BILLING DOC'],
+    'ship_to':       ['SHIP-TO', 'SHIP TO', 'SHIPTO'],
+    'customer_name': ['NAME 1', 'NAME1', 'CUSTOMER NAME', 'CUSTOMER', 'CLIENT NAME'],
     'address':       ['ADDRESS', 'ADDR'],
     'status':        ['ST.', 'STATUS', 'STS'],
     'sold_to':       ['SOLD TO', 'SOLDTO', 'SOLD-TO', 'PAYER'],
     'description':   ['DESCRIPTION', 'SAP DESC', 'DESC', 'PRODUCT DESC',
-                      'MATERIAL DESC', 'TEXT'],
+                      'MATERIAL DESC', 'TEXT', 'ITEM DESC'],
     'cost_group':    ['CGP', 'COST GROUP', 'COSTGROUP', 'COST GRP'],
 }
 
-# Strings that indicate a row is a SAP subtotal/total line, not real data
 SUBTOTAL_INDICATORS = [
     'subtotal', 'sub total', 'total', 'grand total',
     'sum', 'count', '**', '***', 'page total',
 ]
 
-# Known SAP currency code mappings (some SAP configs use non-standard codes)
 CURRENCY_NORMALIZATIONS = {
     'GBP': 'GBP', 'USD': 'USD', 'CAD': 'CAD',
     'AUD': 'AUD', 'NZD': 'NZD', 'ZAR': 'ZAR', 'EUR': 'EUR',
@@ -91,47 +93,29 @@ CURRENCY_NORMALIZATIONS = {
 
 
 def clean_number(val, european_format=False):
-    """
-    Convert string prices to float.
-    Handles:
-        - Standard: $1,234.56 → 1234.56
-        - European: 1.234,56  → 1234.56
-        - Negative: (1,234.56) → -1234.56
-        - Symbols: £, €, R, $
-    """
     if pd.isna(val):
         return None
     cleaned = str(val).strip()
-
-    # Handle accounting negatives: (1,234.56) → -1234.56
     is_negative = cleaned.startswith('(') and cleaned.endswith(')')
     if is_negative:
         cleaned = cleaned[1:-1]
-
-    # Strip currency symbols
     for sym in ['$', '£', '€', '\xa3', '\u20ac']:
         cleaned = cleaned.replace(sym, '')
     cleaned = cleaned.strip()
     if cleaned.startswith('R') and len(cleaned) > 1 and cleaned[1].isdigit():
         cleaned = cleaned[1:]
-
-    # Detect European format: last separator is comma, e.g. 1.234,56
     if not european_format:
-        # Auto-detect: if comma appears after period, it's European
-        comma_pos = cleaned.rfind(',')
+        comma_pos  = cleaned.rfind(',')
         period_pos = cleaned.rfind('.')
         if comma_pos > period_pos and comma_pos > 0:
             european_format = True
-
     if european_format:
         cleaned = cleaned.replace('.', '').replace(',', '.')
     else:
         cleaned = cleaned.replace(',', '')
-
     cleaned = cleaned.replace(' ', '').strip()
     if not cleaned or cleaned.lower() in ('nan', 'none', '-', 'n/a', ''):
         return None
-
     try:
         result = float(cleaned)
         return -result if is_negative else result
@@ -140,45 +124,36 @@ def clean_number(val, european_format=False):
 
 
 def find_header_row(raw_df, sheet_name=''):
-    """
-    Scan up to row 30 for the real header row.
-    SAP exports often have title rows, run dates, or filter criteria at the top.
-    """
+    """Scan up to row 30 for a row containing material AND currency indicators."""
     for i, row in raw_df.head(30).iterrows():
         row_upper = ' '.join(str(v).upper() for v in row.values if pd.notna(v))
-        # Must have both a material indicator AND a value/currency indicator
         has_material = any(k in row_upper for k in
-                          ['MATERIAL', 'PART NUMBER', 'PART NO', 'SKU'])
+                          ['MATERIAL', 'PART NUMBER', 'PART NO', 'SKU', 'MATL'])
         has_value    = any(k in row_upper for k in
                           ['NET VALUE', 'NETVALUE', 'CURR', 'CURRENCY', 'AMOUNT'])
         if has_material and has_value:
-            if i > 0 and sheet_name:
-                log_warn(f"Header found at row {i+1} on sheet '{sheet_name}' "
-                         f"— {i} junk row(s) skipped")
+            if i > 0:
+                log_warn(f"Header found at row {i+1} — {i} junk row(s) skipped above it")
             return i
-    return 0
+    return None
 
 
 def find_data_sheet(xl):
-    """
-    For multi-sheet SAP exports, find the sheet that actually contains billing data.
-    Returns the sheet name to use.
-    """
+    """Find the sheet that contains billing data in a multi-sheet export."""
     for sheet_name in xl.sheet_names:
         try:
-            raw = xl.parse(sheet_name, header=None, nrows=20)
+            raw = xl.parse(sheet_name, header=None, nrows=30)
             for _, row in raw.iterrows():
                 row_upper = ' '.join(str(v).upper() for v in row.values if pd.notna(v))
                 if 'MATERIAL' in row_upper and 'CURR' in row_upper:
                     return sheet_name
         except Exception:
             continue
-    # Fallback to first sheet
     return xl.sheet_names[0]
 
 
 def match_column(columns, patterns):
-    """Match a column name against a list of patterns. Returns first match."""
+    """Exact pattern match — returns first column that contains any pattern."""
     for col in columns:
         col_upper = str(col).upper().replace('.', '').replace('_', ' ').strip()
         for pattern in patterns:
@@ -187,25 +162,88 @@ def match_column(columns, patterns):
     return None
 
 
+def find_near_matches(columns, patterns, threshold=2):
+    """
+    Find columns that are close but not exact matches.
+    Used to give helpful suggestions when a required column is missing.
+    Returns list of (column, pattern, distance) tuples.
+    """
+    near = []
+    for col in columns:
+        col_upper = str(col).upper().replace('.', '').replace('_', ' ').strip()
+        for pattern in patterns:
+            # Check if column contains most of the pattern (missing 1-2 chars)
+            if len(pattern) > 4:
+                for i in range(len(pattern) - 3):
+                    fragment = pattern[i:i+4]
+                    if fragment in col_upper:
+                        near.append((col, pattern))
+                        break
+    return near
+
+
+def diagnose_missing_columns(df, missing_fields):
+    """
+    When required columns are missing, provide detailed diagnostics:
+    - Show all available columns
+    - Suggest near-matches
+    - Check if columns shifted (header row in wrong place)
+    - Check if file has data at all
+    """
+    print(f"\n  {'─'*55}")
+    print(f"  DIAGNOSIS — Could not find: {missing_fields}")
+    print(f"  {'─'*55}")
+    print(f"\n  Columns found in file ({len(df.columns)} total):")
+    for i, col in enumerate(df.columns):
+        print(f"    [{i+1:2d}] '{col}'")
+
+    # Look for near-matches
+    suggestions = {}
+    for field in missing_fields:
+        patterns = COL_PATTERNS[field]
+        near = find_near_matches(df.columns, patterns)
+        if near:
+            suggestions[field] = near
+
+    if suggestions:
+        print(f"\n  Possible matches (columns with similar names):")
+        for field, matches in suggestions.items():
+            for col, pattern in matches[:2]:
+                print(f"    '{field}' might be column '{col}' "
+                      f"(looking for pattern '{pattern}')")
+
+    # Check if data looks shifted — first column has numbers where material should be
+    first_col_sample = df.iloc[:3, 0].tolist()
+    if all(str(v).replace('.', '').replace(',', '').isdigit()
+           for v in first_col_sample if pd.notna(v)):
+        log_warn("First column appears to be numeric — header row may be misidentified. "
+                 "Check if there are extra rows above the real header in the file.")
+
+    # Check if file looks empty
+    if len(df) < 5:
+        log_warn(f"Only {len(df)} data rows found — file may be empty or filtered.")
+
+    print(f"\n  Fix suggestions:")
+    print(f"    1. Open the SAP export and check column headers are in row 1")
+    print(f"       (or that no title/filter rows appear above the data)")
+    print(f"    2. Verify the export includes: Material, Order Quantity, Net Value, Currency")
+    print(f"    3. If SAP was reconfigured, update COL_PATTERNS in sap_cleaner.py")
+    print(f"       to include the new column name")
+    print(f"  {'─'*55}\n")
+
+
 def is_subtotal_row(row, material_col):
-    """
-    Detect SAP subtotal/total rows that shouldn't be treated as billing data.
-    Checks both the material column value and any text fields.
-    """
     mat_val = str(row.get(material_col, '')).strip().lower()
     if any(ind in mat_val for ind in SUBTOTAL_INDICATORS):
         return True
-    # Check all string fields for subtotal markers
     for val in row.values:
-        if pd.notna(val):
-            val_lower = str(val).strip().lower()
-            if any(ind in val_lower for ind in ['subtotal', 'grand total', '***']):
-                return True
+        if pd.notna(val) and any(ind in str(val).strip().lower()
+                                  for ind in ['subtotal', 'grand total', '***']):
+            return True
     return False
 
 
 def normalize_currency(val):
-    """Normalize currency codes including non-standard SAP variants."""
     if pd.isna(val):
         return 'UNKNOWN'
     cleaned = str(val).strip().upper()
@@ -213,11 +251,6 @@ def normalize_currency(val):
 
 
 def detect_number_format(df, col):
-    """
-    Sample the first 20 non-null values in a column to detect
-    whether European number formatting is in use.
-    Returns True if European format detected.
-    """
     samples = df[col].dropna().head(20).astype(str)
     european_votes = 0
     standard_votes = 0
@@ -229,7 +262,7 @@ def detect_number_format(df, col):
         elif period_pos > comma_pos >= 0:
             standard_votes += 1
     if european_votes > standard_votes:
-        log_warn(f"European number format detected in '{col}' column "
+        log_warn(f"European number format detected in '{col}' "
                  f"({european_votes} samples) — adjusting parser")
         return True
     return False
@@ -255,24 +288,38 @@ def run(sap_path):
         print(f"\n  Fix: Make sure the file is not open in Excel and is a valid .xlsx file.")
         return
 
-    # Find the right sheet if multi-sheet export
+    # Find the right sheet
     sheet_name = find_data_sheet(xl)
     if len(xl.sheet_names) > 1:
         log_warn(f"Multiple sheets found {xl.sheet_names} — using '{sheet_name}'")
 
     # Find header row
     raw = xl.parse(sheet_name, header=None)
+
     header_row = find_header_row(raw, sheet_name)
+
+    if header_row is None:
+        log_error("Could not find header row in SAP export.")
+        print(f"\n  Scanned first 30 rows looking for 'Material' and 'Currency' headers.")
+        print(f"\n  Fix suggestions:")
+        print(f"    1. Check the file is a SAP billing export, not a different report type")
+        print(f"    2. Verify column headers are present and not all blank")
+        print(f"    3. If headers are below row 30, move them up in the file")
+        print(f"\n  First 5 rows of file for reference:")
+        for i, row in raw.head(5).iterrows():
+            vals = [str(v) for v in row.values if pd.notna(v)]
+            print(f"    Row {i+1}: {vals}")
+        return
 
     df = xl.parse(sheet_name, header=header_row)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Drop fully blank rows (SAP injects these between customer groups)
-    before_blank_drop = len(df)
+    # Drop fully blank rows
+    before_blank = len(df)
     df = df.dropna(how='all').reset_index(drop=True)
-    blank_rows_dropped = before_blank_drop - len(df)
-    if blank_rows_dropped > 0:
-        log_warn(f"Dropped {blank_rows_dropped:,} blank rows from mid-export")
+    blank_dropped = before_blank - len(df)
+    if blank_dropped > 0:
+        log_warn(f"Dropped {blank_dropped:,} blank rows from mid-export")
 
     print(f"  Raw rows loaded: {len(df):,}")
     print(f"  Columns found:   {list(df.columns)}")
@@ -286,11 +333,17 @@ def run(sap_path):
 
     missing = [f for f in COL_PATTERNS if f not in col_map]
     if missing:
-        log_error(f"Could not find required columns: {missing}")
-        print(f"\n  Columns found in file: {list(df.columns)}")
-        print(f"  Fix: Check that the SAP export contains Material, Order Quantity, "
-              f"Net Value, and Currency columns.")
+        log_error(f"Could not find required column(s): {missing}")
+        diagnose_missing_columns(df, missing)
         return
+
+    # Warn on any required column that was a weak match
+    for field, col in col_map.items():
+        col_upper = str(col).upper().replace('.', '').replace('_', ' ').strip()
+        best_pattern = COL_PATTERNS[field][0]
+        if best_pattern not in col_upper:
+            log_warn(f"'{field}' mapped to '{col}' via fallback pattern — "
+                     f"verify this is the correct column")
 
     # Map context columns
     context_map = {}
@@ -305,11 +358,11 @@ def run(sap_path):
     for field, col in context_map.items():
         print(f"    {field:<15} -> '{col}' (context)")
 
-    # Detect number format before cleaning
+    # Detect number format
     european_fmt = detect_number_format(df, col_map['net_value'])
 
-    # Drop subtotal rows before processing
-    subtotal_mask = df.apply(lambda r: is_subtotal_row(r, col_map['material']), axis=1)
+    # Drop subtotal rows
+    subtotal_mask  = df.apply(lambda r: is_subtotal_row(r, col_map['material']), axis=1)
     subtotal_count = subtotal_mask.sum()
     if subtotal_count > 0:
         log_warn(f"Dropped {subtotal_count:,} subtotal/total rows injected by SAP")
@@ -327,28 +380,30 @@ def run(sap_path):
     )
     clean['currency']  = df[col_map['currency']].apply(normalize_currency)
 
-    # Carry context columns
     for field, col in context_map.items():
         clean[field] = df[col].astype(str).str.strip()
 
     # Drop bad rows
     before = len(clean)
-    clean = clean[
+    clean  = clean[
         clean['material'].notna() &
         (~clean['material'].isin(['nan', 'none', 'NAN', 'NONE', '']))
     ]
     dropped_material = before - len(clean)
 
     after_material = len(clean)
-    clean = clean[clean['net_value'].notna()]
-    dropped_net = after_material - len(clean)
+    clean          = clean[clean['net_value'].notna()]
+    dropped_net    = after_material - len(clean)
 
     # Warn on unexpected currency codes
-    known_currencies = set(CURRENCY_NORMALIZATIONS.values())
-    unknown_currencies = set(clean['currency'].unique()) - known_currencies
-    if unknown_currencies:
-        log_warn(f"Unknown currency codes found: {unknown_currencies} "
-                 f"— these rows will not match pricebook")
+    known      = set(CURRENCY_NORMALIZATIONS.values())
+    unknown    = set(clean['currency'].unique()) - known
+    if unknown:
+        log_warn(f"Unknown currency codes: {unknown} — these rows will not match pricebook")
+
+    # Warn if suspiciously few rows
+    if len(clean) < 10:
+        log_warn(f"Only {len(clean)} clean rows — verify the correct file was loaded")
 
     zero_qty = (clean['quantity'] == 0).sum()
 

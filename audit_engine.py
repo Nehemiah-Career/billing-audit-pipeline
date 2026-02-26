@@ -82,7 +82,7 @@ OUTPUT_COLUMN_ORDER = [
     'status', 'address', 'sales_org', 'created_on', 'sold_to', 'ship_to',
     'order_number', 'material', 'customer_name', 'description',
     'quantity', 'net_value', 'currency', 'cost_group',
-    'tier_max_band', 'price_2025', 'price_2026', 'source_tab',
+    'tier_max_band', 'price_2025', 'price_2026', 'pb_description', 'source_tab',
     'audit_flag', 'variance_vs_2026',
 ]
 
@@ -227,6 +227,18 @@ def run():
     custom_pb      = pb[pb['is_custom']].copy()
     custom_materials = set(custom_pb['material'].unique())
 
+    # Build material → description lookup from pricebook
+    # Take first non-null description per material
+    if 'pb_description' in pb.columns:
+        desc_lookup = (
+            pb[pb['pb_description'].notna()][['material', 'pb_description']]
+            .drop_duplicates(subset='material')
+            .set_index('material')['pb_description']
+            .to_dict()
+        )
+    else:
+        desc_lookup = {}
+
     print(f"\nPricebook: {len(numeric_pb):,} price rows | {pb['material'].nunique()} materials")
     print(f"  Custom-priced materials: {len(custom_materials)}: "
           f"{', '.join(sorted(custom_materials))}")
@@ -278,6 +290,7 @@ def run():
                 'price_2025':       None,
                 'price_2026':       None,
                 'variance_vs_2026': None,
+                'pb_description':   desc_lookup.get(material),
                 'source_tab':       src,
                 'audit_flag':       'CUSTOM_PRICING',
             })
@@ -307,6 +320,7 @@ def run():
                 'price_2025':       None,
                 'price_2026':       None,
                 'variance_vs_2026': None,
+                'pb_description':   desc_lookup.get(material),
                 'source_tab':       src,
                 'audit_flag':       flag,
             })
@@ -336,6 +350,7 @@ def run():
                 'price_2025':       float(p25_dec) if p25_dec is not None else None,
                 'price_2026':       float(p26_dec) if p26_dec is not None else None,
                 'variance_vs_2026': round(variance, 2) if variance is not None else None,
+                'pb_description':   desc_lookup.get(material),
                 'source_tab':       pb_slice['source_tab'].iloc[0],
                 'audit_flag':       flag,
             })
