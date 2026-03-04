@@ -1,4 +1,4 @@
-# IDEXX VetSoft Billing Audit Pipeline
+#  Billing Audit Pipeline
 
 A modular Python pipeline that automates monthly billing validation for veterinary software subscriptions. Replaces a manual Excel-based audit process, reducing review time from hours to minutes.
 
