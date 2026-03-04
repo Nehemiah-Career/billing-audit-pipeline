@@ -1,7 +1,7 @@
 """
 TOOL 1 OF 3 — Pricebook Cleaner
 ================================
-Reads every tab of the IDEXX pricebook and outputs one flat,
+Reads every tab of the pricebook and outputs one flat,
 queryable Excel file where each row is:
 
     material | max_band | currency | price_2025 | price_2026 | source_tab | is_custom
